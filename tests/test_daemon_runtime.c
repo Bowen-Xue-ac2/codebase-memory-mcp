@@ -5624,95 +5624,151 @@ static void *runtime_test_legacy_status_thread(void *opaque) {
     return NULL;
 }
 
-/* Exercise both phases of the real transport: a listener appears after part of
- * the timeout has elapsed, then replies after another part has elapsed. */
-typedef struct {
-    cbm_daemon_ipc_endpoint_t *endpoint;
-    atomic_bool started;
-    bool received;
-} runtime_delayed_control_t;
+#if defined(CBM_ENABLE_TEST_SEAMS)
+/* The budget split is a clock value, not a sleep. The fake server moves that
+ * clock only after it has the STATUS_DETAILS request (so the deadline is
+ * already captured) and before it rejects the attempt. A later STOP frame is
+ * the test's "client is done" event: the server leaves accept because of it,
+ * and a timeout is never what decides the verdict. */
+enum {
+    RUNTIME_BUDGET_HARNESS_MS = 30000,
+    RUNTIME_BUDGET_MS = 10000,
+    RUNTIME_BUDGET_CLOCK = 1000000
+};
 
-static void *runtime_test_delayed_control_thread(void *opaque) {
-    runtime_delayed_control_t *server = opaque;
-    const struct timespec delay = {1, 200000000L};
-    atomic_store_explicit(&server->started, true, memory_order_release);
-    (void)cbm_nanosleep(&delay, NULL);
-    cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(server->endpoint);
-    cbm_daemon_ipc_connection_t *connection = NULL;
-    if (listener && cbm_daemon_ipc_accept(listener, RUNTIME_TEST_TIMEOUT_MS, &connection) == 1) {
-        cbm_daemon_frame_t frame = {0};
-        uint8_t *request = NULL;
-        server->received = cbm_daemon_ipc_receive_frame(connection, RUNTIME_TEST_TIMEOUT_MS,
-                                                        &frame, &request) == 1;
-        if (server->received) {
-            (void)cbm_nanosleep(&delay, NULL);
-            uint8_t response[CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE] = {1};
-            uint32_t length = frame.flags == CBM_DAEMON_RUNTIME_OP_STOP
-                                  ? CBM_DAEMON_STOP_RESPONSE_SIZE
-                              : frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS
-                                  ? CBM_DAEMON_STATUS_RESPONSE_SIZE
-                                  : CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE;
-            (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_RESPONSE, frame.flags,
-                                            response, length);
+typedef struct {
+    cbm_daemon_ipc_listener_t *listener;
+    uint64_t clock_at_reply;
+    int attempts;
+    uint16_t ops[2];
+    bool legacy_served;
+} runtime_budget_server_t;
+
+static void *runtime_test_status_details_budget_thread(void *opaque) {
+    runtime_budget_server_t *server = opaque;
+    for (;;) {
+        cbm_daemon_ipc_connection_t *connection = NULL;
+        if (cbm_daemon_ipc_accept(server->listener, RUNTIME_BUDGET_HARNESS_MS, &connection) != 1) {
+            return NULL;
         }
-        free(request);
+        cbm_daemon_frame_t frame = {0};
+        uint8_t *payload = NULL;
+        int received =
+            cbm_daemon_ipc_receive_frame(connection, RUNTIME_BUDGET_HARNESS_MS, &frame, &payload);
+        free(payload);
+        if (received == 1 && frame.flags == CBM_DAEMON_RUNTIME_OP_STOP) {
+            cbm_daemon_ipc_connection_close(connection);
+            return NULL;
+        }
+        if (received == 1 && server->attempts < 2) {
+            server->ops[server->attempts++] = frame.flags;
+            if (frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS) {
+                cbm_daemon_runtime_set_status_details_clock_for_testing(true,
+                                                                        server->clock_at_reply);
+                uint8_t rejected[CBM_DAEMON_STATUS_DETAILS_RESPONSE_SIZE] = {0};
+                (void)cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_RESPONSE,
+                                                CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS, rejected,
+                                                (uint32_t)sizeof(rejected));
+            } else if (frame.flags == CBM_DAEMON_RUNTIME_OP_STATUS) {
+                uint8_t legacy[CBM_DAEMON_STATUS_RESPONSE_SIZE] = {1};
+                runtime_test_put_u32(legacy + 4, 77);
+                server->legacy_served = cbm_daemon_ipc_send_frame(
+                    connection, CBM_DAEMON_FRAME_RESPONSE, CBM_DAEMON_RUNTIME_OP_STATUS, legacy,
+                    (uint32_t)sizeof(legacy));
+            }
+        }
         cbm_daemon_ipc_connection_close(connection);
     }
-    cbm_daemon_ipc_listener_close(listener);
-    return NULL;
 }
 
-TEST(daemon_runtime_control_timeout_budget_is_specific_to_status_details) {
-    enum { PHASE_TIMEOUT_MS = 2000 };
+static bool runtime_test_budget_release(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    cbm_daemon_ipc_connection_t *connection =
+        cbm_daemon_ipc_connect(endpoint, RUNTIME_BUDGET_HARNESS_MS);
+    uint8_t body[CBM_DAEMON_CONTROL_REQUEST_SIZE] = {0};
+    bool sent = connection &&
+                cbm_daemon_ipc_send_frame(connection, CBM_DAEMON_FRAME_REQUEST,
+                                          CBM_DAEMON_RUNTIME_OP_STOP, body, (uint32_t)sizeof(body));
+    cbm_daemon_ipc_connection_close(connection);
+    return sent;
+}
+
+TEST(daemon_runtime_status_details_shares_one_budget_with_legacy_fallback) {
+    enum {
+        BUDGET_PARTIAL_USED_MS = 2500,
+        BUDGET_PARTIAL_LEFT_MS = RUNTIME_BUDGET_MS - BUDGET_PARTIAL_USED_MS
+    };
+    const uint64_t clocks[] = {
+        RUNTIME_BUDGET_CLOCK + BUDGET_PARTIAL_USED_MS,
+        RUNTIME_BUDGET_CLOCK + RUNTIME_BUDGET_MS,
+    };
+    const bool expect_fallback[] = {true, false};
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
-    for (int operation = 0; operation < 3; operation++) {
+    bool prepared_all = true;
+    bool queried_ok = true;
+    bool attempts_ok = true;
+    bool timeouts_ok = true;
+    bool payload_ok = true;
+    for (size_t scenario = 0; scenario < sizeof(clocks) / sizeof(clocks[0]); scenario++) {
         char parent[RUNTIME_TEST_PATH_CAP] = {0};
         char key[CBM_DAEMON_KEY_SIZE] = {0};
         char runtime_dir[RUNTIME_TEST_PATH_CAP] = {0};
-        bool prepared = th_secure_runtime_parent_new(parent, sizeof(parent), "control-budget") &&
+        bool prepared = th_secure_runtime_parent_new(parent, sizeof(parent), "status-budget") &&
                         cbm_daemon_rendezvous_key(key);
-        cbm_daemon_ipc_endpoint_t *client = prepared ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
-        cbm_daemon_ipc_endpoint_t *server_endpoint =
-            client ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
-        bool copied = client && runtime_test_copy_path(
-                                    runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(client));
-        runtime_delayed_control_t server = {.endpoint = server_endpoint};
-        atomic_init(&server.started, false);
+        cbm_daemon_ipc_endpoint_t *endpoint =
+            prepared ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
+        bool copied = endpoint && runtime_test_copy_path(
+                                      runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        runtime_budget_server_t server = {
+            .listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL,
+            .clock_at_reply = clocks[scenario],
+        };
         cbm_thread_t thread;
-        bool started = server_endpoint &&
-                       cbm_thread_create(&thread, 0, runtime_test_delayed_control_thread, &server) == 0;
-        bool ready = started && runtime_test_wait_atomic_bool(&server.started, PHASE_TIMEOUT_MS);
-        uint64_t start = cbm_now_ms();
-        bool result = false;
-        if (ready && operation == 0) {
-            cbm_daemon_runtime_status_t status = {0};
-            result = cbm_daemon_runtime_request_status(client, &identity, PHASE_TIMEOUT_MS, &status);
-        } else if (ready && operation == 1) {
-            cbm_daemon_runtime_stop_result_t stop = {0};
-            result = cbm_daemon_runtime_request_stop(client, &identity, PHASE_TIMEOUT_MS, &stop);
-        } else if (ready) {
-            cbm_daemon_runtime_status_details_t details = {0};
-            result = cbm_daemon_runtime_request_status_details(client, &identity,
-                                                               PHASE_TIMEOUT_MS, &details);
+        bool started =
+            server.listener &&
+            cbm_thread_create(&thread, 0, runtime_test_status_details_budget_thread, &server) == 0;
+        cbm_daemon_runtime_reset_status_details_attempts_for_testing();
+        cbm_daemon_runtime_set_status_details_clock_for_testing(true, RUNTIME_BUDGET_CLOCK);
+        cbm_daemon_runtime_status_details_t details = {0};
+        bool queried = false;
+        if (started) {
+            queried = cbm_daemon_runtime_request_status_details(endpoint, &identity,
+                                                                RUNTIME_BUDGET_MS, &details);
         }
-        uint64_t elapsed = cbm_now_ms() - start;
-        if (started)
+        bool released = started && runtime_test_budget_release(endpoint);
+        if (started) {
             (void)cbm_thread_join(&thread);
-        cbm_daemon_ipc_endpoint_free(server_endpoint);
-        cbm_daemon_ipc_endpoint_free(client);
+        }
+        cbm_daemon_runtime_set_status_details_clock_for_testing(false, 0);
+        uint32_t timeouts[2] = {0};
+        int noted = cbm_daemon_runtime_status_details_attempt_timeouts_for_testing(timeouts, 2);
+        cbm_daemon_ipc_listener_close(server.listener);
+        cbm_daemon_ipc_endpoint_free(endpoint);
         (void)cbm_rmdir(runtime_dir);
         (void)cbm_rmdir(parent);
-        ASSERT_TRUE(prepared && copied && started && ready && server.received);
-        if (operation < 2) {
-            ASSERT_TRUE(result);
-            ASSERT_TRUE(elapsed > PHASE_TIMEOUT_MS);
-        } else {
-            ASSERT_FALSE(result);
-        }
+
+        bool fallback = expect_fallback[scenario];
+        prepared_all = prepared_all && prepared && copied && started && released;
+        queried_ok = queried_ok && (queried == fallback);
+        attempts_ok =
+            attempts_ok && server.attempts == (fallback ? 2 : 1) &&
+            server.ops[0] == CBM_DAEMON_RUNTIME_OP_STATUS_DETAILS &&
+            (!fallback || (server.ops[1] == CBM_DAEMON_RUNTIME_OP_STATUS && server.legacy_served));
+        timeouts_ok = timeouts_ok && noted == (fallback ? 2 : 1) &&
+                      timeouts[0] == RUNTIME_BUDGET_MS &&
+                      (!fallback || timeouts[1] == BUDGET_PARTIAL_LEFT_MS);
+        payload_ok = payload_ok && details.cache_directory[0] == '\0' &&
+                     (!fallback || details.status.daemon_pid == 77);
     }
+    cbm_daemon_runtime_set_status_details_clock_for_testing(false, 0);
+    ASSERT_TRUE(prepared_all);
+    ASSERT_TRUE(queried_ok);
+    ASSERT_TRUE(attempts_ok);
+    ASSERT_TRUE(timeouts_ok);
+    ASSERT_TRUE(payload_ok);
     PASS();
 }
+#endif
 
 TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply) {
     cbm_daemon_build_identity_t identity =
@@ -5843,7 +5899,9 @@ TEST(daemon_runtime_stop_refuses_while_committed_clients_exist) {
 }
 
 SUITE(daemon_runtime) {
-    RUN_TEST(daemon_runtime_control_timeout_budget_is_specific_to_status_details);
+#if defined(CBM_ENABLE_TEST_SEAMS)
+    RUN_TEST(daemon_runtime_status_details_shares_one_budget_with_legacy_fallback);
+#endif
     RUN_TEST(daemon_runtime_status_details_preserves_long_paths_and_owns_copy);
     RUN_TEST(daemon_runtime_status_details_does_not_disclose_paths_to_forged_peers);
     RUN_TEST(daemon_runtime_status_details_falls_back_to_legacy_on_unsupported_or_malformed_reply);

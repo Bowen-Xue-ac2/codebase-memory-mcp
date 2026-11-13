@@ -308,7 +308,9 @@ bool cbm_daemon_runtime_request_status(const cbm_daemon_ipc_endpoint_t *endpoint
                                        cbm_daemon_runtime_status_t *status_out);
 
 /* Prefer STATUS_DETAILS, then fall back to legacy STATUS within one timeout.
- * A successful legacy reply leaves cache_directory empty. */
+ * The fallback receives only the time the first attempt left over. A successful
+ * legacy reply leaves cache_directory empty. STATUS and STOP are not on this
+ * budget: each keeps the timeout it was given for both connect and receive. */
 bool cbm_daemon_runtime_request_status_details(const cbm_daemon_ipc_endpoint_t *endpoint,
                                                const cbm_daemon_build_identity_t *identity,
                                                uint32_t timeout_ms,
@@ -545,6 +547,15 @@ bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
     const cbm_daemon_runtime_fingerprint_identity_for_testing_t *before,
     const cbm_daemon_runtime_fingerprint_identity_for_testing_t *after,
     char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
+
+/* #2955: pin the clock read by the STATUS_DETAILS budget only. `enabled` false
+ * restores cbm_now_ms. The attempt log records the timeout actually handed to
+ * each try (details, then legacy), so a test can show the fallback got the
+ * leftover without sleeping. Process-global; reset both after use. */
+void cbm_daemon_runtime_set_status_details_clock_for_testing(bool enabled, uint64_t now_ms);
+void cbm_daemon_runtime_reset_status_details_attempts_for_testing(void);
+int cbm_daemon_runtime_status_details_attempt_timeouts_for_testing(uint32_t *timeouts,
+                                                                   int capacity);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */
